@@ -45,7 +45,6 @@ from transformers.utils.quantization_config import (
     QuantizationMethod,
 )
 
-from ...quantization.finegrained.test_machinery import GroupFp4TestConfig, GroupFp4TestQuantizer
 from .utils import (
     E,
     H,
@@ -96,15 +95,9 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
 
     def setUp(self):
         super().setUp()
-        # MXFP8 and MXFP4 ship in later PRs: test-only stand-ins under their `quant_method`
-        self.enterContext(
-            mock.patch.dict(qc.BLOCK_SCALED_CONFIGS, {"mxfp8": Mxfp8LikeTestConfig, "mxfp4": GroupFp4TestConfig})
-        )
-        self.enterContext(
-            mock.patch.dict(
-                auto.AUTO_QUANTIZER_MAPPING, {"mxfp8": Mxfp8LikeTestQuantizer, "mxfp4": GroupFp4TestQuantizer}
-            )
-        )
+        # MXFP8 ship in later PRs: test-only stand-ins under their `quant_method`
+        self.enterContext(mock.patch.dict(qc.BLOCK_SCALED_CONFIGS, {"mxfp8": Mxfp8LikeTestConfig}))
+        self.enterContext(mock.patch.dict(auto.AUTO_QUANTIZER_MAPPING, {"mxfp8": Mxfp8LikeTestQuantizer}))
 
     def _experts(self, weight_format, activation_format=None, impl="grouped_mm", sm100=True):
         cfg = _Cfg()
@@ -153,6 +146,12 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
         # Block-FP8 has one scale per 128x128 block and nothing to swizzle
         _, experts = self._experts("fp8")
         self.assertEqual(experts.gate_up_proj_scale_inv.shape, (4, 4, 2))
+
+    def test_deepgemm_backends_hold_gate_up_stacked(self):
+        """DeepGEMM reads the scale grid row-major, so it needs gate and up stacked."""
+        for impl in ("deepgemm", "deepgemm_megamoe"):
+            _, experts = self._experts("fp8", impl=impl)
+            self.assertFalse(experts.holds_interleaved_gate_up, impl)
 
     def _op_kernel(self):
         kernel, _ = fake_finegrained_kernel()
@@ -255,6 +254,18 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
                 out = converter.convert(key, model=model)
             self.assertEqual(list(out), [key])
 
+    def test_on_the_fly_quantization_still_interleaves_expert_biases(self):
+        from transformers.integrations.finegrained.conversions import FineGrainedDeserialize
+
+        model, experts = self._experts("fp8", sm100=False)
+        quantizer = _quantizer_for(experts.quantization_config)
+        quantizer.pre_quantized = False
+        bias = torch.arange(4 * 256, dtype=torch.float32).reshape(4, 256)
+        key = "experts.gate_up_proj_bias"
+        actual = FineGrainedDeserialize(quantizer).convert({key: bias}, model=model, full_layer_name=key)[key]
+        gate, up = bias.chunk(2, dim=1)
+        torch.testing.assert_close(actual, torch.stack((gate, up), dim=-1).flatten(1))
+
     def test_interleave_op_follows_the_layer_it_fills(self):
         """Check that the op interleaves gate and up only for experts that hold them interleaved.
 
@@ -308,34 +319,23 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
         """Check that an op unwrapping a one-element list refuses a list of several tensors."""
         from transformers.integrations.finegrained.conversions import (
             FineGrainedInputScalesSplit,
+            FineGrainedPackedBlocks,
             FineGrainedQuantize,
+            FineGrainedViewPackedInt8,
         )
 
         tensor = torch.zeros(2, 4, 32, 16, dtype=torch.uint8)
         for op in (
+            FineGrainedPackedBlocks(None),
+            FineGrainedViewPackedInt8(None),
             FineGrainedInputScalesSplit(None),
             FineGrainedQuantize(None),
         ):
             with self.subTest(op=type(op).__name__), self.assertRaises(ValueError):
                 op.convert({"experts.down_proj": [tensor, tensor]})
-
-    def test_deepgemm_backends_hold_gate_up_stacked(self):
-        """DeepGEMM reads the scale grid row-major, so it needs gate and up stacked."""
-        for impl in ("deepgemm", "deepgemm_megamoe"):
-            _, experts = self._experts("fp8", impl=impl)
-            self.assertFalse(experts.holds_interleaved_gate_up, impl)
-
-    def test_on_the_fly_quantization_still_interleaves_expert_biases(self):
-        from transformers.integrations.finegrained.conversions import FineGrainedDeserialize
-
-        model, experts = self._experts("fp8", sm100=False)
-        quantizer = _quantizer_for(experts.quantization_config)
-        quantizer.pre_quantized = False
-        bias = torch.arange(4 * 256, dtype=torch.float32).reshape(4, 256)
-        key = "experts.gate_up_proj_bias"
-        actual = FineGrainedDeserialize(quantizer).convert({key: bias}, model=model, full_layer_name=key)[key]
-        gate, up = bias.chunk(2, dim=1)
-        torch.testing.assert_close(actual, torch.stack((gate, up), dim=-1).flatten(1))
+        # The op re-keys a single target before reading it
+        with self.assertRaises(ValueError):
+            FineGrainedViewPackedInt8(None).convert({"x": [tensor, tensor]}, target_patterns=["experts.down_proj"])
 
 
 @require_torch
